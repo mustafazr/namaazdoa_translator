@@ -1,0 +1,3 @@
+anthropic>=1.0      # --transport api (Anthropic Console key); the claude-code transport needs only the Claude Code CLI
+rapidfuzz>=3.0      # --fuzzy translation-memory matching
+sacrebleu>=2.4      # evaluate.py

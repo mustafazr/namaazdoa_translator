@@ -1,0 +1,13 @@
+# working translations produced with the tool (not part of the repo)
+content/
+
+# derived / generated
+data/
+reports/
+model/
+__pycache__/
+*.pyc
+
+# secrets and local settings
+.env
+*.key
