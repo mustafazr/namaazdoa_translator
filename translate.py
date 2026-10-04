@@ -95,12 +95,14 @@ def main() -> int:
     engine = build_engine(args)
     total = Counter()
     failed_files = 0
-    for path in files:
+    for fi, path in enumerate(files, 1):
         out_path = output_path_for(path, args.out_dir)
         if os.path.exists(out_path) and not args.overwrite:
             print(f"skip {path}: {out_path} exists (use --overwrite)")
             continue
         tf = read_lines(path)
+        if not args.quiet:
+            print(f"[{fi}/{len(files)}] {os.path.basename(path)}", flush=True)
         t0 = time.time()
         results = engine.translate_lines(tf.lines)
         en_lines = [r.en for r in results]

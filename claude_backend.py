@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
@@ -176,6 +177,91 @@ class StyleIndex:
 
 
 # --------------------------------------------------------------------------- #
+# Live progress line
+# --------------------------------------------------------------------------- #
+_LINE_DONE = re.compile(r"^\s*\d+\s*:", re.M)
+
+
+def _mmss(sec: float) -> str:
+    sec = max(0, int(sec))
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+class Progress:
+    """One self-updating status line per Claude call: phase, elapsed time, lines written, ETA, tokens."""
+
+    def __init__(self, label: str = "", expected_lines: int = 0, enabled: bool = True, interval: float = 1.0):
+        self.label, self.expected, self.enabled, self.interval = label, expected_lines, enabled, interval
+        self.t0 = self.t_write = None
+        self.state = "waiting for Claude"
+        self.text = ""
+        self.plan_usage: float | None = None
+        self._last = 0.0
+        self._width = 0
+
+    def start(self):
+        self.t0 = time.time()
+        self.tick(force=True)
+
+    def phase(self, p: str):
+        if p == "started":
+            self.state = "Claude is reading the prompt"
+        elif p == "thinking":
+            self.state = "thinking"
+        elif p == "writing":
+            self.state = "writing"
+            self.t_write = self.t_write or time.time()
+        self.tick(force=True)
+
+    def add_text(self, s: str):
+        self.text += s
+
+    def done_lines(self) -> int:
+        return len(_LINE_DONE.findall(self.text))
+
+    def _render(self) -> str:
+        el = time.time() - (self.t0 or time.time())
+        parts = [f"  {self.label}", _mmss(el), self.state]
+        if self.state == "thinking":
+            parts[-1] = "thinking (no text yet; xhigh effort can think for several minutes)"
+        if self.state == "writing" and self.expected:
+            n = min(self.done_lines(), self.expected)
+            parts[-1] = f"writing {n}/{self.expected} lines"
+            if n >= 2 and self.t_write:
+                rate = (time.time() - self.t_write) / n
+                parts.append(f"ETA {_mmss(rate * (self.expected - n))}")
+            parts.append(f"~{len(self.text) // 4:,} tokens out")
+        if self.plan_usage is not None:
+            parts.append(f"plan 5h usage {self.plan_usage:.0%}")
+        return " | ".join(parts)
+
+    def _write(self, line: str, end: str = ""):
+        pad = max(0, self._width - len(line))
+        sys.stdout.write("\r" + line + " " * pad + end)
+        sys.stdout.flush()
+        self._width = 0 if end else len(line)
+
+    def tick(self, force: bool = False):
+        if not self.enabled:
+            return
+        now = time.time()
+        if force or now - self._last >= self.interval:
+            self._last = now
+            self._write(self._render())
+
+    def finish(self, status: str = "done", usage: dict | None = None):
+        if not self.enabled:
+            return
+        el = time.time() - (self.t0 or time.time())
+        line = f"  {self.label} | {status} in {_mmss(el)}"
+        if usage:
+            line += f" | {usage.get('input', 0):,} tokens in, {usage.get('output', 0):,} out (incl. thinking)"
+        if self.plan_usage is not None:
+            line += f" | plan 5h usage {self.plan_usage:.0%}"
+        self._write(line, end="\n")
+
+
+# --------------------------------------------------------------------------- #
 # Transports
 # --------------------------------------------------------------------------- #
 class AnthropicTransport:
@@ -187,8 +273,10 @@ class AnthropicTransport:
         self.model, self.effort, self.log = model, effort, log
         self.usage = defaultdict(int)
 
-    def complete(self, system: str, user: str, max_tokens: int = 32000) -> str:
+    def complete(self, system: str, user: str, max_tokens: int = 32000, progress: "Progress | None" = None) -> str:
         import anthropic
+        progress = progress or Progress(enabled=False)
+        progress.start()
         kwargs = dict(
             model=self.model,
             max_tokens=max_tokens,
@@ -199,12 +287,21 @@ class AnthropicTransport:
             kwargs["output_config"] = {"effort": self.effort}
         try:
             with self.client.messages.stream(**kwargs) as stream:
+                for ev in stream:
+                    if ev.type == "content_block_start":
+                        progress.phase("thinking" if ev.content_block.type == "thinking" else "writing")
+                    elif ev.type == "content_block_delta" and ev.delta.type == "text_delta":
+                        progress.add_text(ev.delta.text)
+                    progress.tick()
                 msg = stream.get_final_message()
         except anthropic.APIStatusError as e:
+            progress.finish("failed")
             raise RuntimeError(f"Claude API error {e.status_code}: {e.message}") from e
         u = msg.usage
         for k in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
             self.usage[k] += getattr(u, k, 0) or 0
+        progress.finish(usage={"input": (u.input_tokens or 0) + (u.cache_read_input_tokens or 0)
+                               + (u.cache_creation_input_tokens or 0), "output": u.output_tokens or 0})
         if msg.stop_reason == "refusal":
             det = getattr(msg, "stop_details", None)
             raise RuntimeError(f"Claude declined this request ({getattr(det, 'category', None)}): {getattr(det, 'explanation', '')}")
@@ -250,27 +347,85 @@ class ClaudeCodeTransport:
         self.usage = defaultdict(int)
         self.cost_usd = 0.0
 
-    def complete(self, system: str, user: str, max_tokens: int = 32000) -> str:
+    def complete(self, system: str, user: str, max_tokens: int = 32000, progress: "Progress | None" = None) -> str:
+        import queue
+        import threading
+        progress = progress or Progress(enabled=False)
         env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}  # allow running from inside Claude Code
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fh:
             fh.write(system)
             sys_path = fh.name
-        cmd = [self.exe, "-p", "--model", self.model, "--output-format", "json", "--tools", "",
-               "--no-session-persistence", "--system-prompt-file", sys_path]
+        cmd = [self.exe, "-p", "--model", self.model, "--output-format", "stream-json", "--verbose",
+               "--include-partial-messages", "--tools", "", "--no-session-persistence", "--system-prompt-file", sys_path]
         if self.effort:
             cmd += ["--effort", self.effort]
+        data: dict = {}
+        raw_tail: list[str] = []
+        progress.start()
         try:
-            proc = subprocess.run(cmd, input=user.encode("utf-8"), capture_output=True, env=env, timeout=3600)
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            proc.stdin.write(user.encode("utf-8"))
+            proc.stdin.close()
+            lines: "queue.Queue[bytes | None]" = queue.Queue()
+
+            def reader():
+                for ln in proc.stdout:
+                    lines.put(ln)
+                lines.put(None)
+
+            threading.Thread(target=reader, daemon=True).start()
+            deadline = time.time() + 3600
+            while True:
+                try:
+                    ln = lines.get(timeout=1.0)
+                except queue.Empty:
+                    progress.tick()
+                    if time.time() > deadline:
+                        proc.kill()
+                        raise RuntimeError("claude -p timed out after 60 minutes")
+                    continue
+                if ln is None:
+                    break
+                s = ln.decode("utf-8", errors="replace").strip()
+                if not s:
+                    continue
+                try:
+                    d = json.loads(s)
+                except json.JSONDecodeError:
+                    raw_tail = (raw_tail + [s])[-5:]
+                    continue
+                t = d.get("type")
+                if t == "stream_event":
+                    ev = d.get("event") or {}
+                    et = ev.get("type")
+                    if et == "message_start":
+                        progress.phase("started")
+                    elif et == "content_block_start":
+                        bt = (ev.get("content_block") or {}).get("type")
+                        progress.phase("thinking" if bt == "thinking" else "writing")
+                    elif et == "content_block_delta" and (ev.get("delta") or {}).get("type") == "text_delta":
+                        progress.add_text(ev["delta"].get("text", ""))
+                elif t == "rate_limit_event":
+                    w = ((d.get("rate_limit_info") or {}).get("unifiedWindows") or {}).get("five_hour") or {}
+                    if "utilization" in w:
+                        progress.plan_usage = w["utilization"]
+                elif t == "result":
+                    data = d
+                progress.tick()
+            proc.wait(timeout=60)
         finally:
             try:
                 os.unlink(sys_path)
             except OSError:
                 pass
-        out = proc.stdout.decode("utf-8", errors="replace")
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
-            raise RuntimeError(f"claude -p returned non-JSON (exit {proc.returncode}): {out[:500]} {proc.stderr.decode('utf-8', 'replace')[:500]}")
+        if not data:
+            progress.finish("failed")
+            err = proc.stderr.read().decode("utf-8", "replace")[:500] if proc.stderr else ""
+            raise RuntimeError(f"claude -p ended without a result (exit {proc.returncode}): {' | '.join(raw_tail)} {err}")
+        u = data.get("usage") or {}
+        progress.finish(usage={"input": sum(u.get(k, 0) or 0 for k in ("input_tokens", "cache_read_input_tokens",
+                                                                      "cache_creation_input_tokens")),
+                               "output": u.get("output_tokens", 0) or 0})
         if data.get("is_error"):
             msg = str(data.get("result"))
             if "not logged in" in msg.lower():
@@ -397,9 +552,17 @@ class ClaudeEngine:
         return "\n".join(parts)
 
     # ---- translation ------------------------------------------------------ #
-    def _call(self, numbered: list[tuple[int, str]], poem: list[Pair], examples: list[Pair], context) -> dict[int, str]:
+    def _complete(self, user: str, label: str, expected: int) -> str:
+        prog = Progress(label, expected, enabled=self.verbose)
+        try:
+            return self.transport.complete(self.system_prompt, user, progress=prog)
+        except TypeError:  # transport without progress support
+            return self.transport.complete(self.system_prompt, user)
+
+    def _call(self, numbered: list[tuple[int, str]], poem: list[Pair], examples: list[Pair], context,
+              label: str = "retry") -> dict[int, str]:
         user = self._user_prompt(numbered, poem, examples, context)
-        text = self.transport.complete(self.system_prompt, user)
+        text = self._complete(user, label, len(numbered))
         return parse_numbered(text, [n for n, _ in numbered])
 
     def _fix_structure(self, shown: str, en: str, poem, examples, context) -> tuple[str, str]:
@@ -436,20 +599,26 @@ class ClaudeEngine:
                     continue
             todo.append(i)
 
-        for start in range(0, len(todo), self.batch_lines):
+        n_batches = (len(todo) + self.batch_lines - 1) // self.batch_lines
+        n_tm = sum(1 for r in results if r is not None and r.source.startswith("tm"))
+        self._log(f"  {len(raw_lines)} lines: {n_tm} reused from approved translations, {len(todo)} to translate "
+                  f"in {n_batches} batch(es){' + review pass' if self.review and todo else ''}")
+        for bi, start in enumerate(range(0, len(todo), self.batch_lines), 1):
             batch = todo[start:start + self.batch_lines]
             numbered = [(i + 1, shown[i]) for i in batch]
             poem, examples = self._examples_for([srcs[i] for i in batch])
             ctx = sorted(context)[-12:]
+            tag = f"batch {bi}/{n_batches}" if n_batches > 1 else ""
             try:
-                got = self._call(numbered, poem, examples, ctx)
+                got = self._call(numbered, poem, examples, ctx, label=f"translate {tag}".strip())
             except RuntimeError as e:
                 self._log(f"[error] {e}")
                 got = {}
             got = {n: _clean_en(v) for n, v in got.items()}
             if self.review and got:
                 try:
-                    rev = parse_numbered(self.transport.complete(self.system_prompt, self._review_prompt(numbered, got, poem)),
+                    rev = parse_numbered(self._complete(self._review_prompt(numbered, got, poem),
+                                                        f"review {tag}".strip(), len(numbered)),
                                          [n for n, _ in numbered])
                     changed = 0
                     for n, s in numbered:
@@ -457,7 +626,7 @@ class ClaudeEngine:
                         if r and r.count(STANZA_BREAK) == s.count(STANZA_BREAK) and r != got.get(n):
                             got[n] = r
                             changed += 1
-                    self._log(f"review pass: {changed}/{len(numbered)} lines revised")
+                    self._log(f"  review revised {changed}/{len(numbered)} lines")
                 except RuntimeError as e:
                     self._log(f"[review skipped] {e}")
             for i in batch:
