@@ -221,14 +221,16 @@ def find_claude_exe(explicit: str | None = None) -> str | None:
              os.path.expanduser("~/.local/bin/claude.exe"), os.path.expanduser("~/.local/bin/claude")]
     local = os.environ.get("LOCALAPPDATA")
     if local:
-        bundled = glob.glob(os.path.join(local, "Packages", "Claude_*", "LocalCache", "Roaming", "Claude",
-                                         "claude-code", "*", "claude.exe"))
+        roots = glob.glob(os.path.join(local, "Packages", "Claude_*", "LocalCache", "Roaming", "Claude", "claude-code"))
+        roots += [os.path.join(os.environ.get("APPDATA", ""), "Claude", "claude-code")]
+        bundled = [p for r in roots for p in glob.glob(os.path.join(r, "**", "claude.exe"), recursive=True)]
 
         def ver(p: str):
-            parts = os.path.basename(os.path.dirname(p)).split(".")
-            return tuple(int(x) if x.isdigit() else 0 for x in parts)
+            # version folder is the first path component under claude-code, e.g. 2.1.286
+            rel = p.split("claude-code", 1)[-1].strip("\\/").split(os.sep)[0].replace("/", "\\").split("\\")[0]
+            return tuple(int(x) if x.isdigit() else 0 for x in rel.split("."))
 
-        cands += sorted(bundled, key=ver, reverse=True)
+        cands += sorted(bundled, key=lambda p: (ver(p), os.path.getmtime(p)), reverse=True)
     for c in cands:
         if c and os.path.isfile(c):
             return c
