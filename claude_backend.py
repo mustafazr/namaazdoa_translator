@@ -76,6 +76,15 @@ def build_system_prompt() -> str:
     return METHOD + "\nHouse style and glossary:\n" + load_house_style()
 
 
+class FatalClaudeError(RuntimeError):
+    """An error that no retry can fix (login expired, not logged in): stop the whole run."""
+
+
+LOGIN_HELP = ("Claude login has expired or is missing. Log in again: run the Claude Code CLI (`claude`, or the desktop "
+              "app's bundled claude.exe shown at the top of this run), type /login, sign in with your claude.ai account, "
+              "then /exit and re-run. (Or use --transport api with ANTHROPIC_API_KEY.)")
+
+
 @dataclass
 class LineResult:
     en: str
@@ -294,6 +303,9 @@ class AnthropicTransport:
                         progress.add_text(ev.delta.text)
                     progress.tick()
                 msg = stream.get_final_message()
+        except anthropic.AuthenticationError as e:
+            progress.finish("failed")
+            raise FatalClaudeError(f"Anthropic API key rejected: {e.message}") from e
         except anthropic.APIStatusError as e:
             progress.finish("failed")
             raise RuntimeError(f"Claude API error {e.status_code}: {e.message}") from e
@@ -428,9 +440,9 @@ class ClaudeCodeTransport:
                                "output": u.get("output_tokens", 0) or 0})
         if data.get("is_error"):
             msg = str(data.get("result"))
-            if "not logged in" in msg.lower():
-                raise RuntimeError("Claude Code CLI is not logged in. Open a terminal, run `claude`, type `/login` and sign in "
-                                   "with your claude.ai account once; then re-run. (Or use --transport api with ANTHROPIC_API_KEY.)")
+            low = msg.lower()
+            if any(k in low for k in ("not logged in", "authenticate", "oauth", "/login", "invalid api key")):
+                raise FatalClaudeError(f"{LOGIN_HELP}\n(claude said: {msg[:200]})")
             raise RuntimeError(f"claude -p error: {msg[:500]}")
         self.cost_usd += float(data.get("total_cost_usd") or 0)
         for k, v in (data.get("usage") or {}).items():
@@ -478,7 +490,7 @@ def _clean_en(en: str) -> str:
 
 class ClaudeEngine:
     def __init__(self, corpus_pairs: list[Pair], transport, tm: TranslationMemory | None = None, copy_div: bool = True,
-                 fuzzy: float = 0.0, examples_per_line: int = 3, max_examples: int = 40, batch_lines: int = 60,
+                 fuzzy: float = 0.0, examples_per_line: int = 3, max_examples: int = 1000, batch_lines: int = 60,
                  review: bool = True, exclude_keys: set[str] | None = None, verbose: bool = True):
         self.index = StyleIndex(corpus_pairs)
         self.transport = transport
@@ -612,6 +624,8 @@ class ClaudeEngine:
             try:
                 got = self._call(numbered, poem, examples, ctx, label=f"translate {tag}".strip())
             except RuntimeError as e:
+                if isinstance(e, FatalClaudeError):
+                    raise
                 self._log(f"[error] {e}")
                 got = {}
             got = {n: _clean_en(v) for n, v in got.items()}
@@ -628,6 +642,8 @@ class ClaudeEngine:
                             changed += 1
                     self._log(f"  review revised {changed}/{len(numbered)} lines")
                 except RuntimeError as e:
+                    if isinstance(e, FatalClaudeError):
+                        raise
                     self._log(f"[review skipped] {e}")
             for i in batch:
                 en = got.get(i + 1, "")
@@ -635,6 +651,8 @@ class ClaudeEngine:
                     try:  # one retry for a missing line
                         en = _clean_en(self._call([(i + 1, shown[i])], poem, examples, ctx).get(i + 1, ""))
                     except RuntimeError as e:
+                        if isinstance(e, FatalClaudeError):
+                            raise
                         self._log(f"[error] line {i + 1}: {e}")
                 if not en:
                     results[i] = LineResult("", "failed")
@@ -642,6 +660,8 @@ class ClaudeEngine:
                 try:
                     en, tag = self._fix_structure(shown[i], en, poem, examples, ctx)
                 except RuntimeError as e:
+                    if isinstance(e, FatalClaudeError):
+                        raise
                     self._log(f"[error] line {i + 1}: {e}")
                     tag = "claude"
                 results[i] = LineResult(en, tag)

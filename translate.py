@@ -19,6 +19,7 @@ Corpus and format
     --fuzzy 0.95  also reuse human translations for near-identical lines (0 = exact only)
     --no-copy-div do not copy the ÷ marker from the Arabic line into the English line
     --batch-lines 60  how many lines go into one call
+    --max-examples 1000  cap on similar approved lines sent per call (3 per new line before the cap)
     --overwrite   replace an existing output file
 """
 from __future__ import annotations
@@ -30,7 +31,7 @@ import sys
 import time
 from collections import Counter
 
-from claude_backend import ClaudeEngine, load_corpus_pairs, make_transport
+from claude_backend import ClaudeEngine, FatalClaudeError, load_corpus_pairs, make_transport
 from common import TranslationMemory, output_path_for, read_lines, write_lines
 
 
@@ -61,7 +62,8 @@ def build_engine(args) -> ClaudeEngine:
         print(f"claude: {transport.name} model={args.model} effort={args.effort} review={not args.no_review} "
               f"corpus={len(pairs)} lines{exe}", flush=True)
     return ClaudeEngine(pairs, transport, tm=tm, copy_div=not args.no_copy_div, fuzzy=args.fuzzy,
-                        batch_lines=args.batch_lines, review=not args.no_review, verbose=not args.quiet)
+                        batch_lines=args.batch_lines, max_examples=args.max_examples, review=not args.no_review,
+                        verbose=not args.quiet)
 
 
 def main() -> int:
@@ -77,6 +79,7 @@ def main() -> int:
     ap.add_argument("--claude-exe", default=None)
     ap.add_argument("--corpus", default="training_data")
     ap.add_argument("--batch-lines", type=int, default=60)
+    ap.add_argument("--max-examples", type=int, default=1000, help="cap on similar approved lines sent per call (3 per new line before the cap)")
     ap.add_argument("--no-tm", action="store_true")
     ap.add_argument("--fuzzy", type=float, default=0.0)
     ap.add_argument("--no-copy-div", action="store_true")
@@ -104,7 +107,15 @@ def main() -> int:
         if not args.quiet:
             print(f"[{fi}/{len(files)}] {os.path.basename(path)}", flush=True)
         t0 = time.time()
-        results = engine.translate_lines(tf.lines)
+        try:
+            results = engine.translate_lines(tf.lines)
+        except FatalClaudeError as e:
+            print(f"\nSTOPPED: {e}", file=sys.stderr)
+            return 2
+        if all(r.source in ("failed", "blank") for r in results) and any(r.source == "failed" for r in results):
+            print(f"   nothing was translated; {out_path} not written")
+            failed_files += 1
+            continue
         en_lines = [r.en for r in results]
         assert len(en_lines) == len(tf.lines)
         write_lines(out_path, en_lines, newline=tf.newline, trailing_newline=tf.trailing_newline)

@@ -13,7 +13,7 @@ Every file is translated in one or two Claude calls whose prompt contains:
 2. **`house_style.md`**: the glossary of standing renderings (Allah, Husain, Maula, Fatema, salawaat, Dai, Nass ...)
    and style preferences. Edit this file to steer the output; no code change needed.
 3. **Approved examples from the corpus**: an excerpt (up to 30 lines) of the approved poem whose form is closest to the
-   input, plus the most similar approved lines for each new line (character-trigram retrieval).
+   input, plus the 3 most similar approved lines for each new line (character-trigram retrieval; `--max-examples`, default 1000, caps the total).
 4. **The Arabic with its vowel marks**, numbered, plus the already-translated lines of the same file for coherence.
 
 A second **review pass** has Claude check its draft against the Arabic line by line (`--no-review` skips it).
