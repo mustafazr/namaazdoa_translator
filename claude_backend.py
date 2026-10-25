@@ -322,28 +322,98 @@ class AnthropicTransport:
         return "".join(b.text for b in msg.content if b.type == "text")
 
 
+LAST_GOOD_FILE = os.path.join(HERE, ".claude_exe")  # remembers the claude.exe that last worked (git-ignored)
+
+
+def _version_key(path: str) -> tuple:
+    """Sort key for bundled copies: the version folder under claude-code (e.g. 2.1.308), then modification time."""
+    parts = re.split(r"[\\/]", path)
+    ver = ()
+    if "claude-code" in parts:
+        i = parts.index("claude-code")
+        if i + 1 < len(parts):
+            ver = tuple(int(x) if x.isdigit() else 0 for x in parts[i + 1].split("."))
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0.0
+    return ver, mtime
+
+
+def _bundled_copies() -> list[str]:
+    """claude.exe copies bundled with the Claude desktop app, newest first.
+
+    The app has moved its bundle several times (Packages/Claude_*/LocalCache/Roaming/Claude/claude-code,
+    Claude-Data/claude_*/claude-code, ...), so instead of hard-coding one location this scans every folder whose name
+    contains "claude" or "anthropic" directly under %LOCALAPPDATA%, %APPDATA% and %LOCALAPPDATA%/Packages, a few levels
+    deep, for a "claude-code" folder and takes any claude.exe inside it. Takes well under a second.
+    """
+    roots: list[str] = []
+    for base in (os.environ.get("LOCALAPPDATA"), os.environ.get("APPDATA"),
+                 os.path.join(os.environ.get("LOCALAPPDATA", ""), "Packages")):
+        if not base or not os.path.isdir(base):
+            continue
+        try:
+            for entry in os.scandir(base):
+                if entry.is_dir() and re.search(r"claude|anthropic", entry.name, re.I):
+                    roots.append(entry.path)
+        except OSError:
+            continue
+    found: list[str] = []
+    for root in roots:
+        base_depth = root.rstrip("\\/").count(os.sep)
+        for dirpath, dirnames, filenames in os.walk(root):
+            depth = dirpath.count(os.sep) - base_depth
+            if os.path.basename(dirpath).lower() == "claude-code":
+                for sub, _, files in os.walk(dirpath):
+                    found += [os.path.join(sub, f) for f in files if f.lower() in ("claude.exe", "claude")]
+                dirnames[:] = []
+            elif depth >= 5:
+                dirnames[:] = []
+    return sorted(set(found), key=_version_key, reverse=True)
+
+
+def claude_exe_candidates(explicit: str | None = None) -> list[tuple[str, str]]:
+    """Every place a Claude Code executable may be, in order of preference, as (path, where-it-came-from)."""
+    cands: list[tuple[str | None, str]] = [
+        (explicit, "--claude-exe"),
+        (os.environ.get("CLAUDE_EXE"), "CLAUDE_EXE"),
+    ]
+    try:
+        cands.append((open(LAST_GOOD_FILE, encoding="utf-8").read().strip(), "last working path"))
+    except OSError:
+        pass
+    for name in ("claude", "claude.exe", "claude.cmd"):
+        cands.append((shutil.which(name), "PATH"))
+    # standalone CLI (irm https://claude.ai/install.ps1 | iex): fixed path, updates itself in place
+    homes = [os.environ.get("HOME"), os.environ.get("USERPROFILE"), os.path.expanduser("~")]
+    for h in homes:
+        if h:
+            for name in ("claude.exe", "claude"):
+                cands.append((os.path.join(h, ".local", "bin", name), "standalone CLI"))
+    cands.append((os.environ.get("CLAUDE_CODE_EXECPATH"), "running Claude Code session"))
+    cands += [(p, "Claude desktop app") for p in _bundled_copies()]
+    out, seen = [], set()
+    for path, src in cands:
+        if path and os.path.isfile(path):
+            key = os.path.normcase(os.path.abspath(path))
+            if key not in seen:
+                seen.add(key)
+                out.append((os.path.abspath(path), src))
+    return out
+
+
 def find_claude_exe(explicit: str | None = None) -> str | None:
-    """Locate a Claude Code executable: explicit path, CLAUDE_EXE, PATH, standalone install, or the desktop app's bundle."""
-    import glob
-    cands = [explicit, os.environ.get("CLAUDE_EXE"), os.environ.get("CLAUDE_CODE_EXECPATH"),
-             shutil.which("claude"), shutil.which("claude.exe"), shutil.which("claude.cmd"),
-             os.path.expanduser("~/.local/bin/claude.exe"), os.path.expanduser("~/.local/bin/claude")]
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        roots = glob.glob(os.path.join(local, "Packages", "Claude_*", "LocalCache", "Roaming", "Claude", "claude-code"))
-        roots += [os.path.join(os.environ.get("APPDATA", ""), "Claude", "claude-code")]
-        bundled = [p for r in roots for p in glob.glob(os.path.join(r, "**", "claude.exe"), recursive=True)]
+    cands = claude_exe_candidates(explicit)
+    return cands[0][0] if cands else None
 
-        def ver(p: str):
-            # version folder is the first path component under claude-code, e.g. 2.1.286
-            rel = p.split("claude-code", 1)[-1].strip("\\/").split(os.sep)[0].replace("/", "\\").split("\\")[0]
-            return tuple(int(x) if x.isdigit() else 0 for x in rel.split("."))
 
-        cands += sorted(bundled, key=lambda p: (ver(p), os.path.getmtime(p)), reverse=True)
-    for c in cands:
-        if c and os.path.isfile(c):
-            return c
-    return None
+def remember_claude_exe(path: str) -> None:
+    try:
+        with open(LAST_GOOD_FILE, "w", encoding="utf-8") as fh:
+            fh.write(path)
+    except OSError:
+        pass
 
 
 class ClaudeCodeTransport:
@@ -351,15 +421,44 @@ class ClaudeCodeTransport:
     name = "claude-code"
 
     def __init__(self, model: str = DEFAULT_MODEL, effort: str = "xhigh", exe: str | None = None, log=print):
-        self.exe = find_claude_exe(exe)
-        if not self.exe:
-            raise RuntimeError("Claude Code executable not found. Install the CLI (PowerShell: irm https://claude.ai/install.ps1 | iex) "
+        self.candidates = claude_exe_candidates(exe)
+        if not self.candidates:
+            raise RuntimeError("No Claude Code executable found (looked on PATH, in ~/.local/bin and in the Claude desktop "
+                               "app's folders). Install the standalone CLI, which stays at a fixed path:\n"
+                               "    irm https://claude.ai/install.ps1 | iex\n"
                                "or pass --claude-exe PATH (or set CLAUDE_EXE).")
+        self.exe, self.exe_source = self.candidates[0]
+        self.verified = False
         self.model, self.effort, self.log = model, effort, log
         self.usage = defaultdict(int)
         self.cost_usd = 0.0
 
     def complete(self, system: str, user: str, max_tokens: int = 32000, progress: "Progress | None" = None) -> str:
+        """Run the call with the preferred claude.exe; if that copy is gone or logged out, try the next one."""
+        last_err: Exception | None = None
+        for exe, src in list(self.candidates):
+            if not os.path.isfile(exe):
+                continue
+            try:
+                out = self._run(exe, system, user, progress)
+            except OSError as e:  # copy vanished or cannot start (e.g. desktop app updated mid-run)
+                last_err = e
+                self.log(f"\n  [{src}] {exe} could not be started ({e}); trying the next copy")
+                continue
+            except FatalClaudeError as e:
+                last_err = e
+                if len(self.candidates) > 1:
+                    self.log(f"\n  [{src}] {exe} is not logged in; trying the next copy")
+                continue
+            if exe != self.exe or not self.verified:
+                self.exe, self.exe_source, self.verified = exe, src, True
+                remember_claude_exe(exe)
+            return out
+        if isinstance(last_err, FatalClaudeError):
+            raise last_err
+        raise RuntimeError(f"no working Claude Code executable: {last_err}")
+
+    def _run(self, exe: str, system: str, user: str, progress: "Progress | None" = None) -> str:
         import queue
         import threading
         progress = progress or Progress(enabled=False)
@@ -367,7 +466,7 @@ class ClaudeCodeTransport:
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fh:
             fh.write(system)
             sys_path = fh.name
-        cmd = [self.exe, "-p", "--model", self.model, "--output-format", "stream-json", "--verbose",
+        cmd = [exe, "-p", "--model", self.model, "--output-format", "stream-json", "--verbose",
                "--include-partial-messages", "--tools", "", "--no-session-persistence", "--system-prompt-file", sys_path]
         if self.effort:
             cmd += ["--effort", self.effort]

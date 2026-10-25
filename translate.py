@@ -58,7 +58,7 @@ def build_engine(args) -> ClaudeEngine:
     tm = None if args.no_tm else TranslationMemory.build(pairs)
     transport = make_transport(args.transport, args.model, args.effort, claude_exe=args.claude_exe)
     if not args.quiet:
-        exe = f" exe={transport.exe}" if hasattr(transport, "exe") else ""
+        exe = f"\n  claude.exe: {transport.exe} ({transport.exe_source})" if hasattr(transport, "exe") else ""
         print(f"claude: {transport.name} model={args.model} effort={args.effort} review={not args.no_review} "
               f"corpus={len(pairs)} lines{exe}", flush=True)
     return ClaudeEngine(pairs, transport, tm=tm, copy_div=not args.no_copy_div, fuzzy=args.fuzzy,

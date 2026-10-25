@@ -100,9 +100,24 @@ pip install -r requirements.txt
 Then pick how Claude is reached:
 
 **A. claude.ai subscription through the Claude Code CLI (default, no API billing).** Log the CLI in once: run
-`claude` (or the desktop app's bundled `claude.exe`, which `translate.py` auto-detects), type `/login`, sign in with
-your claude.ai account, `/exit`. Each translated file is one or two headless `claude -p` calls that count against
-your plan's usage limits like any Claude Code session.
+`claude`, type `/login`, sign in with your claude.ai account, `/exit`. Each translated file is one or two headless
+`claude -p` calls that count against your plan's usage limits like any Claude Code session.
+
+Recommended: install the standalone CLI (`irm https://claude.ai/install.ps1 | iex` in PowerShell). It lives at a fixed
+path (`<HOME>\.local\bin\claude.exe`) and updates itself in place. The copy bundled with the Claude desktop app also
+works, but the app moves it to a new folder on most updates.
+
+How `translate.py` finds `claude.exe`, in order (the first line of each run shows which one it used and why):
+
+1. `--claude-exe PATH` or the `CLAUDE_EXE` environment variable
+2. the path that worked last time, remembered in `.claude_exe` (git-ignored)
+3. `claude` on PATH
+4. the standalone CLI in `.local\bin` under `HOME` or your Windows profile
+5. the desktop app's bundled copy, found by scanning every Claude-named folder in `%LOCALAPPDATA%`, `%APPDATA%` and
+   `%LOCALAPPDATA%\Packages` (newest version first), so a moved bundle is still found
+
+If the chosen copy cannot start or is not logged in, the next one is tried automatically. If none is logged in, the run
+stops at once with instructions to `/login`.
 
 **B. Anthropic Console API key (pay-as-you-go, separate from the subscription).** Create a key at
 console.anthropic.com and set `ANTHROPIC_API_KEY`; `translate.py` then uses the SDK automatically (`--transport api`

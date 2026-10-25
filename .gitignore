@@ -11,3 +11,6 @@ __pycache__/
 # secrets and local settings
 .env
 *.key
+
+# remembered path of the claude.exe that last worked (machine-specific)
+.claude_exe
